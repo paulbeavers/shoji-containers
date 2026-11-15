@@ -81,7 +81,7 @@ final class ContainersApp: NSObject {
                 guard self.connected else { self.connect(); return }
                 // Status text ("Up 5 minutes") only changes between events; keep it current.
                 if self.tab == .containers {
-                    Task { @MainActor in await self.reload() }
+                    Task { @MainActor in await self.reload(images: false) }
                     self.refreshStats()
                 }
             }
@@ -90,11 +90,21 @@ final class ContainersApp: NSObject {
 
     // MARK: Connection & data
 
+    private var connecting = false
+
+    /// One connection attempt at a time (the 3 s timer retries while Docker starts, and a ping can
+    /// take up to 3 s — an old, failing one must not tear down a newer connection).
     private func connect() {
+        guard !connecting else { return }
         guard let client = DockerClient.discover() else { setDisconnected(); return }
         self.client = client
+        connecting = true
         Task { @MainActor in
-            guard (try? await client.request("GET", "/_ping", timeout: 3))?.ok == true else { setDisconnected(); return }
+            defer { connecting = false }
+            guard (try? await client.request("GET", "/_ping", timeout: 3))?.ok == true else {
+                if !connected { setDisconnected() }
+                return
+            }
             connected = true
             startEvents()
             await reload()
@@ -115,17 +125,21 @@ final class ContainersApp: NSObject {
     private func startEvents() {
         guard let client, events == nil else { return }
         let filters = #"{"type":["container","image"]}"#.urlQueryEscaped
-        events = client.stream("GET", "/events?filters=\(filters)", onLine: { [weak self] _ in
+        var stream: DockerStream?
+        stream = client.stream("GET", "/events?filters=\(filters)", onLine: { [weak self] _ in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.scheduleReload() } }
         }, onEnd: { [weak self] _, _ in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    guard let self, self.events != nil else { return } // cancelled by us
+                    // Only the current stream ending means the daemon went away (not one we cancelled
+                    // or replaced); the timer then reconnects.
+                    guard let self, let s = stream, self.events === s else { return }
                     self.events = nil
-                    self.setDisconnected() // daemon went away; the timer reconnects
+                    self.setDisconnected()
                 }
             }
         })
+        events = stream
     }
 
     /// Events come in bursts (a compose up is dozens); coalesce them.
@@ -140,11 +154,20 @@ final class ContainersApp: NSObject {
         }
     }
 
-    private func reload() async {
+    /// Bumped by each reload; an older reload that finishes after a newer one is dropped.
+    private var reloadGeneration = 0
+
+    /// `images: false` — the periodic status refresh only needs the containers.
+    private func reload(images withImages: Bool = true) async {
         guard let client else { return }
+        reloadGeneration += 1
+        let generation = reloadGeneration
         do {
-            let cs = try await client.get("/containers/json?all=1", as: [DockerContainer].self)
-            let ims = try await client.get("/images/json", as: [DockerImage].self)
+            async let containersJSON = client.get("/containers/json?all=1", as: [DockerContainer].self)
+            async let imagesJSON: [DockerImage]? = withImages ? client.get("/images/json", as: [DockerImage].self) : nil
+            let cs = try await containersJSON
+            let ims = try await imagesJSON ?? images
+            guard generation == reloadGeneration else { return } // a newer reload already applied
             let sorted = cs.sorted { a, b in
                 let pa = a.composeProject ?? "~", pb = b.composeProject ?? "~" // compose groups first
                 return (pa, a.name) < (pb, b.name)
@@ -152,7 +175,12 @@ final class ContainersApp: NSObject {
             let newImages = ims.sorted { $0.created > $1.created }
             // Only the status text changed (the periodic refresh): update rows in place, so
             // hover and buttons aren't rebuilt every few seconds.
-            func shape(_ c: DockerContainer) -> String { "\(c.id)|\(c.state)|\(c.ports.count)|\(c.image)" }
+            // Everything a row shows or acts on except the running status text ("Up 5 minutes"):
+            // a rename, new labels or another exit code rebuild the row.
+            func shape(_ c: DockerContainer) -> String {
+                let labels = (c.labels ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+                return "\(c.id)|\(c.name)|\(c.state)|\(c.ports.count)|\(c.image)|\(labels)|\(c.isRunning ? "" : c.status)"
+            }
             let sameShape = sorted.map(shape) == containers.map(shape) && newImages == images
             containers = sorted
             images = newImages
@@ -292,15 +320,15 @@ final class ContainersApp: NSObject {
         switch action {
         case .shell:
             // bash when the image has it, else sh.
-            Kitty.open(title: "\(ct.name) — shell",
+            openInKitty(title: "\(ct.name) — shell",
                        [docker, "exec", "-it", ct.name, "sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"])
         case .history:
             // The whole log so far, with timestamps, in a pager opened at the end (q quits).
             // Works for stopped containers too, as long as they haven't been removed.
-            Kitty.open(title: "\(ct.name) — log history",
+            openInKitty(title: "\(ct.name) — log history",
                        ["sh", "-c", "'\(docker)' logs --timestamps '\(ct.name)' 2>&1 | less -R +G"])
         case .logs:
-            Kitty.open(title: "\(ct.name) — logs", [docker, "logs", "-f", "--tail", "500", ct.name], hold: true)
+            openInKitty(title: "\(ct.name) — logs", [docker, "logs", "-f", "--tail", "500", ct.name], hold: true)
         case .open:
             if let port = ct.publishedPorts.first, let url = URL(string: "http://localhost:\(port)") {
                 NSWorkspace.shared.open(url) // the default browser
@@ -328,22 +356,33 @@ final class ContainersApp: NSObject {
         }
     }
 
+    /// Shell, logs and run open kitty windows; say so when kitty isn't there.
+    private func openInKitty(title: String, _ command: [String], hold: Bool = false) {
+        if !Kitty.open(title: title, command, hold: hold) {
+            show("kitty isn't installed — Shell, Logs and Run open in kitty (brew install --cask kitty)", error: true)
+        }
+    }
+
     private func perform(_ action: ImageAction, on im: DockerImage) {
         guard let client else { return }
         switch action {
         case .run:
             let ref = im.tags.first ?? im.shortID
-            Kitty.open(title: "\(ref) — run", [DockerClient.cliPath, "run", "--rm", "-it", ref], hold: true)
+            openInKitty(title: "\(ref) — run", [DockerClient.cliPath, "run", "--rm", "-it", ref], hold: true)
         case .remove:
             let alert = NSAlert()
             alert.messageText = "Remove image \(im.displayName)?"
             alert.informativeText = "\(im.shortID) · \(Self.bytes(im.size))"
+                + (im.tags.count > 1 ? "\nAll its tags go with it: " + im.tags.joined(separator: ", ") : "")
             alert.addButton(withTitle: "Remove")
             alert.addButton(withTitle: "Cancel")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
-            // By tag when it has exactly one (removes just that tag), else by id.
-            let ref = im.tags.count == 1 ? im.tags[0] : im.id
-            api("Removing \(im.displayName)…") { try await client.call("DELETE", "/images/\(ref.urlQueryEscaped)") }
+            // By tag when it has exactly one; by id otherwise — and an image under several tags
+            // can only be removed by id with force (Docker refuses "referenced in multiple
+            // repositories"). Images in use are never offered for removal.
+            let path = im.tags.count == 1 ? "/images/\(im.tags[0].urlQueryEscaped)"
+                : "/images/\(im.id.urlQueryEscaped)" + (im.tags.count > 1 ? "?force=1" : "")
+            api("Removing \(im.displayName)…") { try await client.call("DELETE", path) }
         }
     }
 
@@ -478,11 +517,18 @@ final class ContainersApp: NSObject {
         updateSummary()
     }
 
+    /// With title bars hidden the content runs under where the title bar was (still there,
+    /// transparent, and it takes clicks): keep controls below it.
+    private var titlebarInset: CGFloat {
+        guard let w = view.window, w.styleMask.contains(.fullSizeContentView) else { return 0 }
+        return max(0, w.frame.height - w.contentLayoutRect.height)
+    }
+
     private func layout() {
         scroll.frame = view.bounds
         let width = max(420, min(1100, view.bounds.width - 40))
         let x0 = (view.bounds.width - width) / 2
-        var y: CGFloat = 22
+        var y: CGFloat = 22 + titlebarInset
         heading.sizeToFit()
         heading.frame.origin = CGPoint(x: x0, y: y)
         tabs.sizeToFit()
@@ -650,10 +696,12 @@ class DockerRowView: NSView, SelectableRow {
 
     func applyColors() {
         let c = Config.shared
+        // No fill of its own at rest: the window is already translucent (Settings → Windows), and a
+        // translucent card on a translucent window stacks into near-opaque. An outline marks it.
         layer?.backgroundColor = (isSelected ? c.accent.withAlphaComponent(0.18)
-                                  : hovering ? c.surface0.withAlphaComponent(0.6) : c.base.withAlphaComponent(c.windowOpacity)).cgColor
-        layer?.borderWidth = isSelected ? 1 : 0
-        layer?.borderColor = c.accent.withAlphaComponent(0.6).cgColor
+                                  : hovering ? c.surface0.withAlphaComponent(0.6) : NSColor.clear).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = (isSelected ? c.accent.withAlphaComponent(0.6) : c.surface0).cgColor
         dot.layer?.backgroundColor = dotColor.cgColor
         name.textColor = c.text
         detail.textColor = c.overlay0
@@ -731,12 +779,12 @@ final class ContainerRowView: DockerRowView {
         addButton(ct.isPaused ? "play.fill" : active ? "stop.fill" : "play.fill",
                   ct.isPaused ? "Resume" : active ? "Stop" : "Start") { [weak self] in self?.onAction?(.startStop) }
         addButton("arrow.clockwise", "Restart") { [weak self] in self?.onAction?(.restart) }
-        addButton("terminal", "Shell in a terminal tile (docker exec)") { [weak self] in self?.onAction?(.shell) }
-        addButton("doc.text", "Follow live logs in a terminal tile") { [weak self] in self?.onAction?(.logs) }
+        addButton("terminal", "Shell in a kitty window (docker exec)") { [weak self] in self?.onAction?(.shell) }
+        addButton("doc.text", "Follow live logs in a kitty window") { [weak self] in self?.onAction?(.logs) }
         addButton("clock.arrow.circlepath", "Log history (also for stopped containers) in a pager — q quits") { [weak self] in
             self?.onAction?(.history)
         }
-        addButton("safari", "Open the first published port in a browser tile") { [weak self] in self?.onAction?(.open) }
+        addButton("safari", "Open the first published port in your browser") { [weak self] in self?.onAction?(.open) }
         addButton("trash", "Remove") { [weak self] in self?.onAction?(.remove) }
         buttons[1].isEnabled = ct.isRunning
         buttons[2].isEnabled = ct.isRunning
@@ -792,7 +840,7 @@ final class ImageRowView: DockerRowView {
         columns[0].stringValue = ContainersApp.age(image.created)
         columns[1].stringValue = ContainersApp.bytes(image.size)
         columns[2].stringValue = containers > 0 ? "used by \(containers)" : image.isDangling ? "unused, untagged" : "unused"
-        addButton("play.fill", "Run in a terminal tile (docker run --rm -it)") { [weak self] in self?.onAction?(.run) }
+        addButton("play.fill", "Run in a kitty window (docker run --rm -it)") { [weak self] in self?.onAction?(.run) }
         addButton("trash", containers > 0 ? "In use — remove its containers first" : "Remove") { [weak self] in self?.onAction?(.remove) }
         buttons[1].isEnabled = containers == 0
         applyColors()

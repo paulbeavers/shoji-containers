@@ -75,6 +75,7 @@ final class ContainersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.titlebarAppearsTransparent = hide
         window.titleVisibility = hide ? .hidden : .visible
         window.isMovableByWindowBackground = hide
+        window.contentView?.needsLayout = true // content moves below (or up into) the title bar area
         for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(b)?.isHidden = hide
         }
@@ -86,7 +87,7 @@ final class ContainersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         containers.focus()
     }
 
-    // The Dock icon (or ⌥M in Shoji) brings the window back.
+    // The Dock icon (or Mod+O in Shoji) brings the window back.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showWindow()
         return true

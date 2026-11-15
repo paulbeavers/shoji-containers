@@ -56,7 +56,7 @@ final class DockerClient: @unchecked Sendable {
         return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK
     }
 
-    /// The docker CLI, for commands run in terminal tiles (exec, logs, run).
+    /// The docker CLI, for commands run in kitty windows (exec, logs, run).
     static var cliPath: String {
         let home = NSHomeDirectory()
         for p in ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", home + "/.docker/bin/docker",
@@ -132,12 +132,14 @@ final class DockerClient: @unchecked Sendable {
                          stream: DockerStream? = nil, onChunk: ((Data) -> Bool)?) throws -> Response {
         let fd = try connect()
         stream?.fd = fd
+        // Cancelled while connecting: cancel() found no fd to shut down, so stop here.
+        if stream?.isCancelled == true { throw DockerError.message("cancelled") }
         defer { stream?.fd = -1; close(fd) }
         if let timeout {
             var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         }
-        var req = "\(method) \(path) HTTP/1.1\r\nHost: docker\r\nUser-Agent: MacLucent\r\nConnection: close\r\n"
+        var req = "\(method) \(path) HTTP/1.1\r\nHost: docker\r\nUser-Agent: ShojiContainers\r\nConnection: close\r\n"
         if let body {
             req += "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n"
         } else if method == "POST" {

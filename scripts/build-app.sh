@@ -34,6 +34,6 @@ rm -rf "$ICONSET" build/icon-1024.png
 codesign --force --sign - \
   -r='designated => identifier "dev.shoji.Containers"' "$APP"
 
-# Register with Launch Services, so Shoji's Mod+M finds it by bundle id.
+# Register with Launch Services, so Shoji's Mod+O finds it by bundle id.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" || true
 echo "Built $APP"

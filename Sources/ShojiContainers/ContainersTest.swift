@@ -22,6 +22,8 @@ enum ContainersTest {
             let docker = DockerClient.cliPath
             guard let client = DockerClient.discover() else { log("no Docker socket"); NSApp.terminate(nil); return }
             log("socket \(client.socketPath)")
+            // Leave the user's own alpine:3.20 alone: only remove it if this test pulled it.
+            let hadAlpine = (try? await client.request("GET", "/images/alpine:3.20/json"))?.ok == true
             _ = try? await client.call("POST", "/images/create?fromImage=alpine&tag=3.20", timeout: 120)
             func sh(_ args: [String]) {
                 let p = Process()
@@ -44,7 +46,7 @@ enum ContainersTest {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             log("--- images"); rows(images).forEach(log)
             sh(["rm", "-f", "shoji-test-web", "shoji-test-solo"])
-            sh(["rmi", "alpine:3.20"])
+            if !hadAlpine { sh(["rmi", "alpine:3.20"]) }
             log("cleaned up")
             NSApp.terminate(nil)
         }
