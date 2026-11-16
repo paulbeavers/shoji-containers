@@ -20,3 +20,7 @@ open "build/Shoji Containers.app"
 - Follows Shoji's theme and Windows settings (opacity, title bars).
 
 Requires macOS 13+, kitty, a Docker engine, and a Swift toolchain to build.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
